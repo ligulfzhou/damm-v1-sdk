@@ -13,7 +13,6 @@ import {
   ComputeBudgetProgram,
   Keypair,
 } from '@solana/web3.js';
-import { TokenInfo } from '@solana/spl-token-registry';
 import {
   AccountLayout,
   ASSOCIATED_TOKEN_PROGRAM_ID,
@@ -23,9 +22,16 @@ import {
   MintLayout,
   NATIVE_MINT,
   TOKEN_PROGRAM_ID,
+  getMint,
+  getAssociatedTokenAddressSync,
 } from '@solana/spl-token';
-import VaultImpl, { calculateWithdrawableAmount, getVaultPdas } from '@mercurial-finance/vault-sdk';
-import StakeForFee, { deriveFeeVault, STAKE_FOR_FEE_PROGRAM_ID, StakeForFeeProgram } from '@meteora-ag/stake-for-fee';
+import VaultImpl, { calculateWithdrawableAmount, getVaultPdas } from '@meteora-ag/vault-sdk';
+import StakeForFee, {
+  deriveFeeVault,
+  InitializeVaultParams,
+  STAKE_FOR_FEE_PROGRAM_ID,
+  StakeForFeeProgram,
+} from '@meteora-ag/m3m3';
 import invariant from 'invariant';
 import {
   AccountType,
@@ -448,6 +454,7 @@ export default class AmmImpl implements AmmImplementation {
       };
       stakeLiquidity?: {
         ratio?: Decimal;
+        param: Omit<InitializeVaultParams, 'padding'>;
       };
       activationPoint?: BN;
     },
@@ -603,11 +610,19 @@ export default class AmmImpl implements AmmImplementation {
     const ixs: Array<Transaction | TransactionInstruction | (Transaction | TransactionInstruction)[]> = [];
 
     if (preInstructions.length) {
-      ixs.push(preInstructions);
+      // https://explorer.solana.com/tx/3G95TWMmTLbZ7aAgyGmZd8JFk19ye8whVB5cXhYCCsUWSUsnuVMqPMXbPiY5WaF4zE2Sz7CG5e4jTj8NQbCnUG14?cluster=devnet
+      // Create 2 dynamic vault consume around 190k CU. Each create ATA + Wrap SOL around 23k
+      const setComputeUnitLimitIx = ComputeBudgetProgram.setComputeUnitLimit({
+        units: 300_000,
+      });
+      ixs.push([setComputeUnitLimitIx, ...preInstructions]);
     }
 
+    // https://explorer.solana.com/tx/4X37hBoUNwpmHKNGpQB3M72xDA7yhFKhbYrkBQUK4skBGD7P9LdWgb2WpvFGHcxYi13e9bdwhetsqmULeW7nUDbW?cluster=devnet
+    // https://explorer.solana.com/tx/3xMGCQ9GAqSMZH1uhXXc1quZit61DXr1KsbVxdBN1zCkQy1GTXBGuWgxzWfMEdecdRi859m3mYQKuLyemvR18VHS?cluster=devnet
+    // Create dynamic pool consume around 287k, create lock escrow + lock liquidity around 84k
     const setComputeUnitLimitIx = ComputeBudgetProgram.setComputeUnitLimit({
-      units: 1_400_000,
+      units: 450_000,
     });
     ixs.push([setComputeUnitLimitIx, createPermissionlessPoolTx]);
 
@@ -619,6 +634,13 @@ export default class AmmImpl implements AmmImplementation {
         payer,
         tokenAMint,
         tokenBMint,
+        {
+          unstakeLockDuration: opt?.stakeLiquidity?.param.unstakeLockDuration || new BN(0),
+          secondsToFullUnlock: opt?.stakeLiquidity?.param.secondsToFullUnlock || new BN(0),
+          topListLength: opt?.stakeLiquidity?.param.topListLength || 0,
+          startFeeDistributeTimestamp: opt?.stakeLiquidity?.param.startFeeDistributeTimestamp || new BN(0),
+          padding: new Array<number>(64).fill(0),
+        },
       );
 
       preInstructions.push(...createFeeVaultIxs);
@@ -861,11 +883,16 @@ export default class AmmImpl implements AmmImplementation {
     const ixs: Array<Transaction | TransactionInstruction | (Transaction | TransactionInstruction)[]> = [];
 
     if (preInstructions.length) {
-      ixs.push(preInstructions);
+      // Create 2 dynamic vault consume around 190k CU. Each create ATA + Wrap SOL around 23k
+      const setComputeUnitLimitIx = ComputeBudgetProgram.setComputeUnitLimit({
+        units: 300_000,
+      });
+      ixs.push([setComputeUnitLimitIx, ...preInstructions]);
     }
 
+    // Create dynamic pool consume around 287k, create lock escrow + lock liquidity around 84k
     const setComputeUnitLimitIx = ComputeBudgetProgram.setComputeUnitLimit({
-      units: 1_400_000,
+      units: 450_000,
     });
 
     ixs.push([setComputeUnitLimitIx, createPermissionlessPoolTx]);
@@ -909,13 +936,14 @@ export default class AmmImpl implements AmmImplementation {
     tokenBAmount: BN,
     config: PublicKey,
     memecoinInfo: {
-      keypair: Keypair;
-      payer: PublicKey;
-      assetData: DataV2;
-      mintAuthority: PublicKey;
-      freezeAuthority: PublicKey | null;
-      decimals: number;
-      mintAmount: BN;
+      isMinted?: boolean;
+      keypair?: Keypair;
+      payer?: PublicKey;
+      assetData?: DataV2;
+      mintAuthority?: PublicKey;
+      freezeAuthority?: PublicKey | null;
+      decimals?: number;
+      mintAmount?: BN;
     },
     opt?: {
       cluster?: Cluster;
@@ -940,42 +968,61 @@ export default class AmmImpl implements AmmImplementation {
   ) {
     const { vaultProgram, ammProgram } = createProgram(connection, opt?.programId);
 
-    const { tx: mintTx, mintAccount } = await createMint(
-      connection,
-      memecoinInfo.keypair,
-      memecoinInfo.payer,
-      memecoinInfo.assetData,
-      memecoinInfo.mintAuthority,
-      null,
-      memecoinInfo.decimals,
-      TOKEN_PROGRAM_ID,
-    );
+    const createTokenIxs: TransactionInstruction[] = [];
 
-    const createTokenIxs: TransactionInstruction[] = [...mintTx.instructions];
+    if (!memecoinInfo.isMinted) {
+      if (
+        !memecoinInfo.keypair ||
+        !memecoinInfo.payer ||
+        !memecoinInfo.mintAuthority ||
+        !memecoinInfo.mintAmount ||
+        !memecoinInfo.assetData ||
+        memecoinInfo.freezeAuthority === undefined
+      ) {
+        throw new Error('Missing required fields for minting Memecoin.');
+      }
 
-    const [ata, createAtaIx] = await getOrCreateATAInstruction(
-      mintAccount.publicKey,
-      memecoinInfo.mintAuthority,
-      connection,
-      memecoinInfo.payer,
-    );
+      const { tx: mintTx, mintAccount } = await createMint(
+        connection,
+        memecoinInfo.keypair,
+        memecoinInfo.payer,
+        memecoinInfo.assetData,
+        memecoinInfo.mintAuthority,
+        memecoinInfo.freezeAuthority,
+        memecoinInfo.decimals || 0,
+        TOKEN_PROGRAM_ID,
+      );
 
-    createAtaIx && createTokenIxs.push(createAtaIx);
+      createTokenIxs.push(...mintTx.instructions);
 
-    const mintToIx = createMintToInstruction(
-      mintAccount.publicKey,
-      ata,
-      memecoinInfo.mintAuthority,
-      BigInt(memecoinInfo.mintAmount.toString()),
-    );
-    createTokenIxs.push(mintToIx);
-    const revokeMintAuthorityIx = createSetAuthorityInstruction(
-      mintAccount.publicKey,
-      memecoinInfo.mintAuthority,
-      0,
-      null,
-    );
-    createTokenIxs.push(revokeMintAuthorityIx);
+      const [ata, createAtaIx] = await getOrCreateATAInstruction(
+        mintAccount.publicKey,
+        memecoinInfo.mintAuthority,
+        connection,
+        memecoinInfo.payer,
+      );
+
+      createAtaIx && createTokenIxs.push(createAtaIx);
+
+      const mintToIx = createMintToInstruction(
+        mintAccount.publicKey,
+        ata,
+        memecoinInfo.mintAuthority,
+        BigInt(memecoinInfo.mintAmount.toString()),
+      );
+
+      createTokenIxs.push(mintToIx);
+
+      const revokeMintAuthorityIx = createSetAuthorityInstruction(
+        mintAccount.publicKey,
+        memecoinInfo.mintAuthority,
+        0,
+        null,
+      );
+
+      createTokenIxs.push(revokeMintAuthorityIx);
+    }
+
     let preInstructions: Array<TransactionInstruction> = [...createTokenIxs];
 
     const [
@@ -1130,11 +1177,16 @@ export default class AmmImpl implements AmmImplementation {
     const ixs: Array<Transaction | TransactionInstruction | (Transaction | TransactionInstruction)[]> = [];
 
     if (preInstructions.length) {
-      ixs.push(preInstructions);
+      // Create 2 dynamic vault consume around 190k CU. Each create ATA + Wrap SOL around 23k
+      const setComputeUnitLimitIx = ComputeBudgetProgram.setComputeUnitLimit({
+        units: 300_000,
+      });
+      ixs.push([setComputeUnitLimitIx, ...preInstructions]);
     }
 
+    // Create dynamic pool consume around 287k, create lock escrow + lock liquidity around 84k
     const setComputeUnitLimitIx = ComputeBudgetProgram.setComputeUnitLimit({
-      units: 1_400_000,
+      units: 450_000,
     });
 
     ixs.push([setComputeUnitLimitIx, createPermissionlessPoolTx]);
@@ -1223,8 +1275,8 @@ export default class AmmImpl implements AmmImplementation {
   public static async createPermissionlessPool(
     connection: Connection,
     payer: PublicKey,
-    tokenInfoA: TokenInfo,
-    tokenInfoB: TokenInfo,
+    mintA: PublicKey,
+    mintB: PublicKey,
     tokenAAmount: BN,
     tokenBAmount: BN,
     isStable: boolean,
@@ -1236,14 +1288,13 @@ export default class AmmImpl implements AmmImplementation {
   ): Promise<Transaction> {
     const { vaultProgram, ammProgram } = createProgram(connection, opt?.programId);
 
-    const curveType = generateCurveType(tokenInfoA, tokenInfoB, isStable);
+    const [tokenMintA, tokenMintB] = await Promise.all([mintA, mintB].map((m) => getMint(connection, m)));
+    const curveType = generateCurveType(tokenMintA.decimals, tokenMintB.decimals, isStable);
 
-    const tokenAMint = new PublicKey(tokenInfoA.address);
-    const tokenBMint = new PublicKey(tokenInfoB.address);
     const [
       { vaultPda: aVault, tokenVaultPda: aTokenVault, lpMintPda: aLpMintPda },
       { vaultPda: bVault, tokenVaultPda: bTokenVault, lpMintPda: bLpMintPda },
-    ] = [getVaultPdas(tokenAMint, vaultProgram.programId), getVaultPdas(tokenBMint, vaultProgram.programId)];
+    ] = [getVaultPdas(mintA, vaultProgram.programId), getVaultPdas(mintB, vaultProgram.programId)];
     const [aVaultAccount, bVaultAccount] = await Promise.all([
       vaultProgram.account.vault.fetchNullable(aVault),
       vaultProgram.account.vault.fetchNullable(bVault),
@@ -1258,29 +1309,30 @@ export default class AmmImpl implements AmmImplementation {
     preInstructions.push(setComputeUnitLimitIx);
 
     if (!aVaultAccount) {
-      const createVaultAIx = await VaultImpl.createPermissionlessVaultInstruction(
-        connection,
-        payer,
-        new PublicKey(tokenInfoA.address),
-      );
+      const createVaultAIx = await VaultImpl.createPermissionlessVaultInstruction(connection, payer, mintA);
       createVaultAIx && preInstructions.push(createVaultAIx);
     } else {
       aVaultLpMint = aVaultAccount.lpMint; // Old vault doesn't have lp mint pda
     }
     if (!bVaultAccount) {
-      const createVaultBIx = await VaultImpl.createPermissionlessVaultInstruction(
-        connection,
-        payer,
-        new PublicKey(tokenInfoB.address),
-      );
+      const createVaultBIx = await VaultImpl.createPermissionlessVaultInstruction(connection, payer, mintB);
       createVaultBIx && preInstructions.push(createVaultBIx);
     } else {
       bVaultLpMint = bVaultAccount.lpMint; // Old vault doesn't have lp mint pda
     }
 
-    const poolPubkey = derivePoolAddress(connection, tokenInfoA, tokenInfoB, isStable, tradeFeeBps, {
-      programId: opt?.programId,
-    });
+    const poolPubkey = derivePoolAddress(
+      connection,
+      tokenMintA.address,
+      tokenMintB.address,
+      tokenMintA.decimals,
+      tokenMintB.decimals,
+      isStable,
+      tradeFeeBps,
+      {
+        programId: opt?.programId,
+      },
+    );
 
     const [[aVaultLp], [bVaultLp]] = [
       PublicKey.findProgramAddressSync([aVault.toBuffer(), poolPubkey.toBuffer()], ammProgram.programId),
@@ -1288,8 +1340,8 @@ export default class AmmImpl implements AmmImplementation {
     ];
 
     const [[payerTokenA, createPayerTokenAIx], [payerTokenB, createPayerTokenBIx]] = await Promise.all([
-      getOrCreateATAInstruction(tokenAMint, payer, connection),
-      getOrCreateATAInstruction(tokenBMint, payer, connection),
+      getOrCreateATAInstruction(mintA, payer, connection),
+      getOrCreateATAInstruction(mintB, payer, connection),
     ]);
 
     if (!opt?.skipAta) {
@@ -1299,11 +1351,11 @@ export default class AmmImpl implements AmmImplementation {
 
     const [[protocolTokenAFee], [protocolTokenBFee]] = [
       PublicKey.findProgramAddressSync(
-        [Buffer.from(SEEDS.FEE), tokenAMint.toBuffer(), poolPubkey.toBuffer()],
+        [Buffer.from(SEEDS.FEE), mintA.toBuffer(), poolPubkey.toBuffer()],
         ammProgram.programId,
       ),
       PublicKey.findProgramAddressSync(
-        [Buffer.from(SEEDS.FEE), tokenBMint.toBuffer(), poolPubkey.toBuffer()],
+        [Buffer.from(SEEDS.FEE), mintB.toBuffer(), poolPubkey.toBuffer()],
         ammProgram.programId,
       ),
     ];
@@ -1315,11 +1367,11 @@ export default class AmmImpl implements AmmImplementation {
 
     const payerPoolLp = await getAssociatedTokenAccount(lpMint, payer);
 
-    if (tokenAMint.equals(NATIVE_MINT)) {
+    if (mintA.equals(NATIVE_MINT)) {
       preInstructions = preInstructions.concat(wrapSOLInstruction(payer, payerTokenA, BigInt(tokenAAmount.toString())));
     }
 
-    if (tokenBMint.equals(NATIVE_MINT)) {
+    if (mintB.equals(NATIVE_MINT)) {
       preInstructions = preInstructions.concat(wrapSOLInstruction(payer, payerTokenB, BigInt(tokenBAmount.toString())));
     }
 
@@ -1329,8 +1381,8 @@ export default class AmmImpl implements AmmImplementation {
       .initializePermissionlessPoolWithFeeTier(curveType, tradeFeeBps, tokenAAmount, tokenBAmount)
       .accounts({
         pool: poolPubkey,
-        tokenAMint,
-        tokenBMint,
+        tokenAMint: mintA,
+        tokenBMint: mintB,
         aVault,
         bVault,
         aVaultLpMint,
@@ -2046,7 +2098,7 @@ export default class AmmImpl implements AmmImplementation {
 
     const postInstructions: Array<TransactionInstruction> = [];
     if (NATIVE_MINT.equals(destinationToken)) {
-      const unwrapSOLIx = await unwrapSOLInstruction(owner);
+      const unwrapSOLIx = await unwrapSOLInstruction(owner, owner);
       unwrapSOLIx && postInstructions.push(unwrapSOLIx);
     }
 
@@ -2320,7 +2372,7 @@ export default class AmmImpl implements AmmImplementation {
 
     const postInstructions: Array<TransactionInstruction> = [];
     if ([this.tokenAMint.address.toBase58(), this.tokenBMint.address.toBase58()].includes(NATIVE_MINT.toBase58())) {
-      const closeWrappedSOLIx = await unwrapSOLInstruction(owner);
+      const closeWrappedSOLIx = await unwrapSOLInstruction(owner, owner);
       closeWrappedSOLIx && postInstructions.push(closeWrappedSOLIx);
     }
 
@@ -2478,7 +2530,7 @@ export default class AmmImpl implements AmmImplementation {
 
     const postInstructions: Array<TransactionInstruction> = [];
     if ([this.tokenAMint.address.toBase58(), this.tokenBMint.address.toBase58()].includes(NATIVE_MINT.toBase58())) {
-      const closeWrappedSOLIx = await unwrapSOLInstruction(owner);
+      const closeWrappedSOLIx = await unwrapSOLInstruction(owner, owner);
       closeWrappedSOLIx && postInstructions.push(closeWrappedSOLIx);
     }
 
@@ -2695,41 +2747,293 @@ export default class AmmImpl implements AmmImplementation {
     return transaction.add(...stakeForFeeInstructions);
   }
 
-  public async claimLockFee(owner: PublicKey, maxAmount: BN): Promise<Transaction> {
-    const [lockEscrowPK] = deriveLockEscrowPda(this.address, owner, this.program.programId);
-
+  private async claimWithQuoteMintSol({
+    owner,
+    payer,
+    receiver,
+    tempWSolAcc,
+    lockEscrowPK,
+  }: {
+    owner: PublicKey;
+    payer: PublicKey;
+    receiver: PublicKey;
+    tempWSolAcc: PublicKey;
+    lockEscrowPK: PublicKey;
+  }): Promise<{
+    accounts: {
+      pool: PublicKey;
+      lockEscrow: PublicKey;
+      owner: PublicKey;
+      lpMint: PublicKey;
+      sourceTokens: PublicKey;
+      escrowVault: PublicKey;
+      tokenProgram: PublicKey;
+      aVault: PublicKey;
+      bVault: PublicKey;
+      aVaultLp: PublicKey;
+      bVaultLp: PublicKey;
+      aVaultLpMint: PublicKey;
+      bVaultLpMint: PublicKey;
+      vaultProgram: PublicKey;
+      aTokenVault: PublicKey;
+      bTokenVault: PublicKey;
+      userAToken: PublicKey;
+      userBToken: PublicKey;
+    };
+    preInstructions: TransactionInstruction[];
+    postInstructions: TransactionInstruction[];
+  }> {
     const preInstructions: TransactionInstruction[] = [];
+    const postInstructions: TransactionInstruction[] = [];
+
+    const isTokenAMintNative = this.poolState.tokenAMint.toBase58() === NATIVE_MINT.toBase58();
+    const isTokenBMintNative = this.poolState.tokenBMint.toBase58() === NATIVE_MINT.toBase58();
+
     const [
       [userAta, createUserAtaIx],
       [escrowAta, createEscrowAtaIx],
       [tokenAAta, createTokenAAtaIx],
       [tokenBAta, createTokenBAtaIx],
     ] = await Promise.all([
-      getOrCreateATAInstruction(this.poolState.lpMint, owner, this.program.provider.connection),
-      getOrCreateATAInstruction(this.poolState.lpMint, lockEscrowPK, this.program.provider.connection),
-      getOrCreateATAInstruction(this.poolState.tokenAMint, owner, this.program.provider.connection),
-      getOrCreateATAInstruction(this.poolState.tokenBMint, owner, this.program.provider.connection),
+      getOrCreateATAInstruction(this.poolState.lpMint, owner, this.program.provider.connection, payer),
+      getOrCreateATAInstruction(this.poolState.lpMint, lockEscrowPK, this.program.provider.connection, payer),
+      getOrCreateATAInstruction(
+        this.poolState.tokenAMint,
+        isTokenAMintNative ? tempWSolAcc : receiver,
+        this.program.provider.connection,
+        payer,
+      ),
+      getOrCreateATAInstruction(
+        this.poolState.tokenBMint,
+        isTokenBMintNative ? tempWSolAcc : receiver,
+        this.program.provider.connection,
+        payer,
+      ),
     ]);
     createUserAtaIx && preInstructions.push(createUserAtaIx);
     createEscrowAtaIx && preInstructions.push(createEscrowAtaIx);
     createTokenAAtaIx && preInstructions.push(createTokenAAtaIx);
     createTokenBAtaIx && preInstructions.push(createTokenBAtaIx);
 
-    const postInstructions: Array<TransactionInstruction> = [];
-    if ([this.poolState.tokenAMint.toBase58(), this.poolState.tokenBMint.toBase58()].includes(NATIVE_MINT.toBase58())) {
-      const closeWrappedSOLIx = await unwrapSOLInstruction(owner);
-      closeWrappedSOLIx && postInstructions.push(closeWrappedSOLIx);
+    const closeWrappedSOLIx = await unwrapSOLInstruction(tempWSolAcc, receiver);
+    closeWrappedSOLIx && postInstructions.push(closeWrappedSOLIx);
+
+    const accounts = {
+      pool: this.address,
+      lockEscrow: lockEscrowPK,
+      owner,
+      lpMint: this.poolState.lpMint,
+      sourceTokens: userAta,
+      escrowVault: escrowAta,
+      tokenProgram: TOKEN_PROGRAM_ID,
+      aVault: this.poolState.aVault,
+      bVault: this.poolState.bVault,
+      aVaultLp: this.poolState.aVaultLp,
+      bVaultLp: this.poolState.bVaultLp,
+      aVaultLpMint: this.vaultA.vaultState.lpMint,
+      bVaultLpMint: this.vaultB.vaultState.lpMint,
+      vaultProgram: this.vaultProgram.programId,
+      aTokenVault: this.vaultA.vaultState.tokenVault,
+      bTokenVault: this.vaultB.vaultState.tokenVault,
+      userAToken: tokenAAta,
+      userBToken: tokenBAta,
+    };
+
+    return { accounts, preInstructions, postInstructions };
+  }
+
+  private async claimWithQuoteMintNotSol({
+    owner,
+    payer,
+    receiver,
+    lockEscrowPK,
+  }: {
+    owner: PublicKey;
+    payer: PublicKey;
+    receiver: PublicKey;
+    lockEscrowPK: PublicKey;
+  }): Promise<{
+    accounts: {
+      pool: PublicKey;
+      lockEscrow: PublicKey;
+      owner: PublicKey;
+      lpMint: PublicKey;
+      sourceTokens: PublicKey;
+      escrowVault: PublicKey;
+      tokenProgram: PublicKey;
+      aVault: PublicKey;
+      bVault: PublicKey;
+      aVaultLp: PublicKey;
+      bVaultLp: PublicKey;
+      aVaultLpMint: PublicKey;
+      bVaultLpMint: PublicKey;
+      vaultProgram: PublicKey;
+      aTokenVault: PublicKey;
+      bTokenVault: PublicKey;
+      userAToken: PublicKey;
+      userBToken: PublicKey;
+    };
+    preInstructions: TransactionInstruction[];
+  }> {
+    const preInstructions: TransactionInstruction[] = [];
+
+    const [
+      [userAta, createUserAtaIx],
+      [escrowAta, createEscrowAtaIx],
+      [tokenAAta, createTokenAAtaIx],
+      [tokenBAta, createTokenBAtaIx],
+    ] = await Promise.all([
+      getOrCreateATAInstruction(this.poolState.lpMint, owner, this.program.provider.connection, payer),
+      getOrCreateATAInstruction(this.poolState.lpMint, lockEscrowPK, this.program.provider.connection, payer),
+      getOrCreateATAInstruction(this.poolState.tokenAMint, receiver, this.program.provider.connection, payer),
+      getOrCreateATAInstruction(this.poolState.tokenBMint, receiver, this.program.provider.connection, payer),
+    ]);
+    createUserAtaIx && preInstructions.push(createUserAtaIx);
+    createEscrowAtaIx && preInstructions.push(createEscrowAtaIx);
+    createTokenAAtaIx && preInstructions.push(createTokenAAtaIx);
+    createTokenBAtaIx && preInstructions.push(createTokenBAtaIx);
+
+    const accounts = {
+      pool: this.address,
+      lockEscrow: lockEscrowPK,
+      owner,
+      lpMint: this.poolState.lpMint,
+      sourceTokens: userAta,
+      escrowVault: escrowAta,
+      tokenProgram: TOKEN_PROGRAM_ID,
+      aVault: this.poolState.aVault,
+      bVault: this.poolState.bVault,
+      aVaultLp: this.poolState.aVaultLp,
+      bVaultLp: this.poolState.bVaultLp,
+      aVaultLpMint: this.vaultA.vaultState.lpMint,
+      bVaultLpMint: this.vaultB.vaultState.lpMint,
+      vaultProgram: this.vaultProgram.programId,
+      aTokenVault: this.vaultA.vaultState.tokenVault,
+      bTokenVault: this.vaultB.vaultState.tokenVault,
+      userAToken: tokenAAta,
+      userBToken: tokenBAta,
+    };
+
+    return { accounts, preInstructions };
+  }
+
+  public async claimLockFee(
+    owner: PublicKey,
+    maxAmount: BN,
+    payer: PublicKey,
+    receiver?: PublicKey,
+    tempWSolAcc?: PublicKey,
+  ): Promise<Transaction> {
+    const [lockEscrowPK] = deriveLockEscrowPda(this.address, owner, this.program.programId);
+
+    const isTokenAOrBNative =
+      this.poolState.tokenAMint.toBase58() === NATIVE_MINT.toBase58() ||
+      this.poolState.tokenBMint.toBase58() === NATIVE_MINT.toBase58();
+
+    let tx: Transaction;
+
+    if (isTokenAOrBNative) {
+      const tempWSol = receiver && !receiver.equals(owner) ? tempWSolAcc : owner;
+      const feeReceiver = receiver ? receiver : owner;
+
+      const result = await this.claimWithQuoteMintSol({
+        owner,
+        payer,
+        receiver: feeReceiver,
+        tempWSolAcc: tempWSol!,
+        lockEscrowPK,
+      });
+
+      tx = await this.program.methods
+        .claimFee(maxAmount)
+        .accounts(result.accounts)
+        .preInstructions(result.preInstructions)
+        .postInstructions(result.postInstructions)
+        .transaction();
+    } else {
+      const feeReceiver = receiver ? receiver : owner;
+
+      const result = await this.claimWithQuoteMintNotSol({
+        owner,
+        payer,
+        receiver: feeReceiver,
+        lockEscrowPK,
+      });
+
+      tx = await this.program.methods
+        .claimFee(maxAmount)
+        .accounts(result.accounts)
+        .preInstructions(result.preInstructions)
+        .transaction();
     }
 
+    return new Transaction({
+      feePayer: payer,
+      ...(await this.program.provider.connection.getLatestBlockhash(this.program.provider.connection.commitment)),
+    }).add(tx);
+  }
+
+  /**
+   * `moveLockedLP` transfers locked LP tokens from one owner's escrow to another owner's escrow.
+   * If the new owner does not have an existing lock escrow, it creates one.
+   *
+   * @param {PublicKey} owner - The public key of the current owner of the locked LP tokens.
+   * @param {PublicKey} newOwner - The public key of the new owner to transfer the locked LP tokens to.
+   * @param {BN} maxAmount - The maximum amount of LP tokens to transfer.
+   * @param {PublicKey} [payer] - Optional. The public key of the payer for the transaction fees. Defaults to the current owner.
+   * @returns {Promise<Transaction>} A promise that resolves to a transaction object for the locked LP token transfer.
+   */
+  public async moveLockedLP(
+    owner: PublicKey,
+    newOwner: PublicKey,
+    maxAmount: BN,
+    payer?: PublicKey,
+  ): Promise<Transaction> {
+    payer = payer ?? owner;
+
+    const [ownerLockEscrowPK] = deriveLockEscrowPda(this.address, owner, this.program.programId);
+    const [newOwnerLockEscrowPK] = deriveLockEscrowPda(this.address, newOwner, this.program.programId);
+
+    const preInstructions: TransactionInstruction[] = [];
+
+    const newOwnerLockEscrow = this.program.account.lockEscrow.fetchNullable(newOwnerLockEscrowPK);
+
+    if (!newOwnerLockEscrow) {
+      const createLockEscrowIx = await this.program.methods
+        .createLockEscrow()
+        .accounts({
+          pool: this.address,
+          lockEscrow: newOwnerLockEscrowPK,
+          owner: newOwner,
+          lpMint: this.poolState.lpMint,
+          payer,
+          systemProgram: SystemProgram.programId,
+        })
+        .instruction();
+      preInstructions.push(createLockEscrowIx);
+    }
+
+    const fromEscrowVault = getAssociatedTokenAddressSync(this.poolState.lpMint, ownerLockEscrowPK);
+
+    const [toEscrowVault, createToEscrowVaultIx] = await getOrCreateATAInstruction(
+      this.poolState.lpMint,
+      newOwnerLockEscrowPK,
+      this.program.provider.connection,
+      payer,
+    );
+
+    createToEscrowVaultIx && preInstructions.push(createToEscrowVaultIx);
+
     const tx = await this.program.methods
-      .claimFee(maxAmount)
+      .moveLockedLp(maxAmount)
       .accounts({
         pool: this.address,
-        lockEscrow: lockEscrowPK,
+        fromLockEscrow: ownerLockEscrowPK,
+        toLockEscrow: newOwnerLockEscrowPK,
+        fromEscrowVault,
+        toEscrowVault,
         owner,
         lpMint: this.poolState.lpMint,
-        sourceTokens: userAta,
-        escrowVault: escrowAta,
         tokenProgram: TOKEN_PROGRAM_ID,
         aVault: this.poolState.aVault,
         bVault: this.poolState.bVault,
@@ -2737,19 +3041,16 @@ export default class AmmImpl implements AmmImplementation {
         bVaultLp: this.poolState.bVaultLp,
         aVaultLpMint: this.vaultA.vaultState.lpMint,
         bVaultLpMint: this.vaultB.vaultState.lpMint,
-        vaultProgram: this.vaultProgram.programId,
-        aTokenVault: this.vaultA.vaultState.tokenVault,
-        bTokenVault: this.vaultB.vaultState.tokenVault,
-        userAToken: tokenAAta,
-        userBToken: tokenBAta,
       })
       .preInstructions(preInstructions)
-      .postInstructions(postInstructions)
       .transaction();
-    return new Transaction({
-      feePayer: owner,
+
+    const transaction = new Transaction({
+      feePayer: payer,
       ...(await this.program.provider.connection.getLatestBlockhash(this.program.provider.connection.commitment)),
     }).add(tx);
+
+    return transaction;
   }
 
   private async createATAPreInstructions(owner: PublicKey, mintList: Array<PublicKey>) {

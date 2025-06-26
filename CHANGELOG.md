@@ -19,6 +19,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## @meteora-ag/dynamic-amm-sdk [1.3.8] - PR[#218](https://github.com/MeteoraAg/dynamic-amm-sdk/pull/218)
+
+### Changed
+
+- update `@meteora-ag/m3m3` version
+
+## @meteora-ag/dynamic-amm-sdk [1.3.7] - PR[#217](https://github.com/MeteoraAg/dynamic-amm-sdk/pull/217)
+
+### Fixed
+
+- Fix `createPermissionlessConstantProductPoolWithConfig2` to allow user to pass in fee farm configuration value
+
+## @meteora-ag/dynamic-amm-sdk [1.3.3] - PR[#209](https://github.com/MeteoraAg/dynamic-amm-sdk/pull/209)
+
+### Changed
+
+- update readme
+
+## @meteora-ag/dynamic-amm-sdk [1.3.2] - PR[#206](https://github.com/MeteoraAg/dynamic-amm-sdk/pull/206)
+
+### Changed
+
+- Bump `@meteora-ag/m3m3`
+
+## commons [0.0.5] - PR[#195](https://github.com/MeteoraAG/dynamic-amm-sdk/pull/195)
+
+### Added
+
+- PDA helpers to derive accounts for dynamic amm and vault
+
+## @meteora-ag/dynamic-amm-sdk [1.3.1] - PR[#202](https://github.com/MeteoraAg/dynamic-amm-sdk/pull/202)
+
+### Added
+
+- added `moveLockedLP` to transfers locked LP tokens from one owner's escrow to another owner's escrow
+
+## @meteora-ag/dynamic-amm-sdk [1.3.0] - PR[#198](https://github.com/MeteoraAg/dynamic-amm-sdk/pull/198)
+
+### Security
+
+- remove `@solana/spl-token-registry` usage
+
+## @meteora-ag/dynamic-amm-sdk [1.2.1] - PR[#197](https://github.com/MeteoraAg/dynamic-amm-sdk/pull/197)
+
+### Security
+
+- update `@meteora-ag/vault-sdk` version
+
+## @meteora-ag/dynamic-amm-sdk [1.2.0] - PR[#196](https://github.com/MeteoraAg/dynamic-amm-sdk/pull/196)
+
+### Changed
+
+- move to `meteora-ag` org
+
+## @mercurial-finance/dynamic-amm-sdk [1.1.23] - PR[#192](https://github.com/mercurial-finance/mercurial-dynamic-amm-sdk/pull/192)
+
+### Changed
+
+- Added new parameter `memecoinInfo.isMinted` to `createPermissionlessConstantProductMemecoinPoolWithConfig` to allow creating a fee vault with minted token
+
+## @mercurial-finance/dynamic-amm-sdk [1.1.22] - PR[#191](https://github.com/mercurial-finance/mercurial-dynamic-amm-sdk/pull/191)
+
+### Added
+
+- Bump `@solana/web3.js`
+
+## @mercurial-finance/dynamic-amm-sdk [1.1.21] - PR[#190](https://github.com/mercurial-finance/mercurial-dynamic-amm-sdk/pull/190)
+
+### Added
+
+- Update `@meteora-ag/m3m3@1.0.4`
+
+## @mercurial-finance/dynamic-amm-sdk [1.1.20] - PR[#183](https://github.com/mercurial-finance/mercurial-dynamic-amm-sdk/pull/183)
+
+### Changed
+
+- Use optimal CU when creating pool instead of requesting max CU
+
 ## dynamic-amm [0.6.1] - PR [180](https://github.com/mercurial-finance/mercurial-dynamic-amm-sdk/pull/180)
 
 ### Added
@@ -351,3 +429,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `AmmImpl.createPermissionlessConstantProductPoolWithConfig` to create constant product pool based on `config` account.
 - `AmmImpl.getFeeConfigurations` to get all fee configurations to be used in `AmmImpl.createPermissionlessConstantProductPoolWithConfig`
+
+## dynamic-amm [1.3.5] - PR #215
+
+### Changed
+
+- `AmmImpl.claimLockFee` to include `receiver` and `payer` parameters to indicate the receiver and payer of the fees.
+
+## dynamic-amm [1.3.6] - PR #216
+
+### Changed
+
+- `AmmImpl.claimLockFee` to include `tempWSolAcc` parameter to indicate the temporary SOL account to receive the WSOL transaction fee.
+- `unwrapSolInstruction` to include `receiver` parameter to indicate the receiver of the unwrapped SOL.

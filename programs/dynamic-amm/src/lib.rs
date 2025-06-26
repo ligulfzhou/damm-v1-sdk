@@ -9,6 +9,7 @@ pub mod constants;
 pub mod error;
 pub mod event;
 pub mod instructions;
+pub mod seed;
 pub mod state;
 
 use crate::state::CurveType;
@@ -218,6 +219,11 @@ pub mod dynamic_amm {
         token_b_amount: u64,
         activation_point: Option<u64>,
     ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Move locked lp
+    pub fn move_locked_lp(ctx: Context<MoveLockedLp>, max_amount: u64) -> Result<()> {
         Ok(())
     }
 }
